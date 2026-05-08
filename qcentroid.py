@@ -1,13 +1,9 @@
 """
-qcentroid.py - Round 3 entry point.
+qcentroid.py - Iter 2 entry point.
 
-Round 3 deltas:
-- Marco: forward `solver_params.warm_start` (list of {job_id, machine_id, start})
-  to mip_model.build_and_solve() so the MIP can resume from ALNS or any prior
-  feasible schedule. Closes the residual gap fast.
-- Priya: compute `objective_value_eur` from configurable rates so the board
-  sees rupees/EUR not opaque scalarized scores. Rates come from
-  `solver_params.business_rates` or sensible defaults.
+Default routing: disjunctive multi-op MIP (matches what ALNS/SQA solve).
+Set solver_params.formulation = "time_indexed" to opt back into the §3
+encoding (smaller but loses multi-op routings).
 """
 from __future__ import annotations
 
@@ -21,22 +17,20 @@ from pathlib import Path
 from typing import Any, Dict
 
 from adapter import to_internal, validate_internal
-from mip_model import build_and_solve
 from outputs import write_additional_outputs
 from additional_output_generator import generate_additional_output
 
-SOLVER_VERSION = "1.4.0-optspec-mip-warm-eur"
+SOLVER_VERSION = "2.0.0-optspec-mip-disjunctive"
 SOLVER_FAMILY = "MIP"
 SPECIALIST_ID = "MIP"
 SPECIALIST_SOURCE = "github.com/georgekorpas/opt-specialists/blob/main/03_MIP_specialist.md"
-ALGORITHM_NAME = "OptSpec_MIP_Pyomo_HiGHS"
+ALGORITHM_NAME = "OptSpec_MIP_Disjunctive_HiGHS"
 
-# Priya's defaults — board-friendly, calibrated to Jindal Stainless rough magnitudes.
 DEFAULT_BUSINESS_RATES = {
-    "line_rate_eur_h": 2000.0,        # opportunity cost per hour of makespan
-    "sla_penalty_eur_h": 500.0,       # SLA penalty per hour of weighted tardiness
-    "setup_cost_eur": 80.0,           # cost per changeover (cleaning + lost throughput)
-    "energy_tariff_eur_kwh": 0.12,    # weighted-average industrial tariff
+    "line_rate_eur_h": 2000.0,
+    "sla_penalty_eur_h": 500.0,
+    "setup_cost_eur": 80.0,
+    "energy_tariff_eur_kwh": 0.12,
 }
 
 
@@ -45,7 +39,9 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     t0 = time.perf_counter()
     max_exec_time_m = float(kwargs.get("max_exec_time_m", 5.0))
     mip_gap = float(kwargs.get("mip_gap", 0.05))
-    extended = bool(kwargs.get("extended", False))
+    formulation = str(kwargs.get("formulation", "disjunctive")).lower()
+    # disjunctive always honors multi-op; time-indexed honors flag
+    extended = True if formulation == "disjunctive" else bool(kwargs.get("extended", False))
     solver_name = str(kwargs.get("solver", "auto")).lower()
     warm_start = kwargs.get("warm_start") or None
     business_rates = {**DEFAULT_BUSINESS_RATES, **(kwargs.get("business_rates") or {})}
@@ -63,9 +59,14 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
     try:
         time_limit_s = max(5.0, max_exec_time_m * 60.0 * 0.7)
-        sol = build_and_solve(internal, time_limit_s=time_limit_s,
-                              mip_gap=mip_gap, solver_name=solver_name,
-                              extended=extended, warm_start=warm_start)
+        if formulation == "disjunctive":
+            from mip_model_disjunctive import build_and_solve as _solve_d
+            sol = _solve_d(internal, time_limit_s=time_limit_s, mip_gap=mip_gap,
+                           solver_name=solver_name, extended=extended, warm_start=warm_start)
+        else:
+            from mip_model import build_and_solve as _solve_t
+            sol = _solve_t(internal, time_limit_s=time_limit_s, mip_gap=mip_gap,
+                           solver_name=solver_name, extended=extended, warm_start=warm_start)
     except Exception as exc:
         return _error_result("solver", exc, started_utc, t0, dataset_sha256)
 
@@ -84,7 +85,6 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     energy_kwh = sol.get("energy_kwh", 0.0)
     objective_value = sol["objective_value"]
 
-    # Priya: board-friendly EUR objective
     objective_value_eur = round(
         business_rates["line_rate_eur_h"] * makespan_hours
         + business_rates["sla_penalty_eur_h"] * total_tardiness_hours
@@ -106,7 +106,7 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
                   specialist_source=SPECIALIST_SOURCE, dataset_sha256=dataset_sha256,
                   run_started_at_utc=started_utc, wall_seconds=wall,
                   solver_name=sol["solver_name"], mip_gap_achieved=sol.get("mip_gap_achieved"),
-                  extended=extended),
+                  formulation=formulation),
     )
 
     finished_utc = datetime.now(timezone.utc).isoformat()
@@ -127,7 +127,7 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
     result_dict = {
         "objective_value": objective_value,
-        "objective_value_eur": objective_value_eur,  # Priya's board-friendly KPI
+        "objective_value_eur": objective_value_eur,
         "makespan_hours": makespan_hours,
         "total_tardiness_hours": total_tardiness_hours,
         "on_time_delivery_pct": on_time_delivery_pct,
@@ -149,7 +149,7 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             "specialist_id": SPECIALIST_ID, "specialist_source": SPECIALIST_SOURCE,
             "modeling_library": "pyomo", "underlying_solver": sol["solver_name"],
             "mip_gap_target": mip_gap, "mip_gap_achieved": sol.get("mip_gap_achieved"),
-            "extended": extended,
+            "formulation": formulation,
             "warm_start_hits": sol.get("warm_start_hits", 0),
             "business_rates": business_rates,
         },
@@ -183,14 +183,14 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
 def run(data: Dict[str, Any], solver_params: Dict[str, Any] = None,
         extra_arguments: Dict[str, Any] = None) -> Dict[str, Any]:
-    """QCentroid platform entry point."""
     solver_params = solver_params or {}
     extra_arguments = extra_arguments or {}
     kwargs = dict(
         max_exec_time_m=float(extra_arguments.get("max_exec_time_m",
                                                   solver_params.get("max_exec_time_m", 5.0))),
         mip_gap=float(solver_params.get("mip_gap", 0.05)),
-        extended=bool(solver_params.get("extended", False)),
+        formulation=str(solver_params.get("formulation", "disjunctive")).lower(),
+        extended=bool(solver_params.get("extended", True)),
         solver=str(solver_params.get("solver", "auto")).lower(),
         warm_start=solver_params.get("warm_start") or extra_arguments.get("warm_start"),
         business_rates=solver_params.get("business_rates"),
