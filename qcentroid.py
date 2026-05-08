@@ -5,21 +5,19 @@ qcentroid.py — Entry point for the Dynamic Production Scheduling solver
 Pipeline source: opt-specialists / 00_classifier.md → 03_MIP_specialist.md
 QCentroid use case 743: Dynamic Production Scheduling with Quantum-Inspired Metaheuristics
 
-Contract (matches QCentroid Technical Details tab):
-    INPUT:  dict with key `data` carrying jobs, machines, processing_times,
-            setup_matrix, planning_horizon, maintenance_schedules, …
-            plus benchmarking root params (num_jobs, num_machines,
-            planning_horizon_hours).
-    OUTPUT: dict with `result` carrying schedule, gantt_data, makespan_hours,
-            objective_value, on_time_delivery_pct, total_tardiness_hours,
-            avg_machine_utilization_pct, total_changeovers, plus the standard
-            QCentroid `benchmark` sub-dict (execution_cost, time_elapsed,
-            energy_consumption) and audit/compliance fields.
+Output schema is aligned with the two existing solvers
+(jindalstainless-classical-scheduling-alns-cpu and
+jindalstainless-quantum-scheduling-qubo-sqa-cpu) so the platform's benchmark
+charts can compare all three uniformly:
 
-Library / solver versions (verified 2026-05-08):
-    pyomo == 6.7.3
-    highspy >= 1.7.0    (open-source MIP)
-    gurobipy >= 11.0    (optional, auto-detected via GRB_LICENSE_FILE)
+  - All 6 top-level KPIs: makespan_hours, objective_value,
+    on_time_delivery_pct, total_tardiness_hours,
+    avg_machine_utilization_pct, total_changeovers
+  - benchmark sub-dict: execution_cost = {value, unit: "credits"},
+    time_elapsed = "<float>s" (string), energy_consumption = float
+  - schedule = {assignments, gantt_data, makespan, total_tardiness,
+    total_idle_time, total_energy_kwh, total_cost, jobs_on_time, jobs_late,
+    on_time_percentage}
 """
 from __future__ import annotations
 
@@ -36,7 +34,7 @@ from adapter import to_internal, validate_internal
 from mip_model import build_and_solve
 from outputs import write_additional_outputs
 
-SOLVER_VERSION = "1.0.0-optspec-mip"
+SOLVER_VERSION = "1.1.0-optspec-mip-aligned"
 SOLVER_FAMILY = "MIP"
 SPECIALIST_ID = "MIP"
 SPECIALIST_SOURCE = (
@@ -45,10 +43,6 @@ SPECIALIST_SOURCE = (
 
 
 def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    """In-process API. Returns {'result': {...}}.
-
-    See `run()` for the QCentroid platform-side entry point.
-    """
     started_utc = datetime.now(timezone.utc).isoformat()
     t0 = time.perf_counter()
 
@@ -94,41 +88,60 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     objective_value = sol["objective_value"]
 
     write_additional_outputs(
-        additional_dir,
-        schedule=schedule,
-        jobs=internal["jobs"],
-        machines=internal["machines"],
+        additional_dir, schedule=schedule, jobs=internal["jobs"], machines=internal["machines"],
         horizon=horizon,
         kpis=dict(
             makespan_hours=makespan_hours, objective_value=objective_value,
             on_time_delivery_pct=on_time_delivery_pct, total_tardiness_hours=total_tardiness_hours,
-            avg_machine_utilization_pct=avg_machine_utilization_pct, total_changeovers=total_changeovers,
-            energy_kwh=energy_kwh,
+            avg_machine_utilization_pct=avg_machine_utilization_pct,
+            total_changeovers=total_changeovers, energy_kwh=energy_kwh,
         ),
         meta=dict(
-            solver_version=SOLVER_VERSION, specialist_id=SPECIALIST_ID, specialist_source=SPECIALIST_SOURCE,
-            dataset_sha256=dataset_sha256, run_started_at_utc=started_utc, wall_seconds=wall,
-            solver_name=sol["solver_name"], mip_gap_achieved=sol.get("mip_gap_achieved"), extended=extended,
+            solver_version=SOLVER_VERSION, specialist_id=SPECIALIST_ID,
+            specialist_source=SPECIALIST_SOURCE, dataset_sha256=dataset_sha256,
+            run_started_at_utc=started_utc, wall_seconds=wall,
+            solver_name=sol["solver_name"], mip_gap_achieved=sol.get("mip_gap_achieved"),
+            extended=extended,
         ),
     )
 
     finished_utc = datetime.now(timezone.utc).isoformat()
 
+    # Schedule wrapped to match the shape used by the two existing solvers
+    n_on_time = round(on_time_delivery_pct * len(internal["jobs"]) / 100.0)
+    schedule_wrapped = {
+        "assignments": schedule,
+        "gantt_data": _gantt_data(schedule, internal["machines"]),
+        "makespan": makespan_hours,
+        "total_tardiness": total_tardiness_hours,
+        "total_idle_time": max(0, len(internal["machines"]) * horizon - sum(s["end"] - s["start"] for s in schedule)),
+        "total_energy_kwh": energy_kwh,
+        "total_cost": objective_value,
+        "jobs_on_time": n_on_time,
+        "jobs_late": len(internal["jobs"]) - n_on_time,
+        "on_time_percentage": on_time_delivery_pct,
+    }
+
     return {
         "result": {
+            # ---- Top-level KPIs (drive QCentroid benchmark charts; aligned) ----
             "objective_value": objective_value,
             "makespan_hours": makespan_hours,
             "total_tardiness_hours": total_tardiness_hours,
             "on_time_delivery_pct": on_time_delivery_pct,
             "avg_machine_utilization_pct": avg_machine_utilization_pct,
             "total_changeovers": total_changeovers,
+            # ---- benchmark sub-dict (shape matches existing solvers) ----
             "benchmark": {
-                "execution_cost": objective_value,
-                "time_elapsed": wall,
+                "execution_cost": {"value": round(wall * 0.5, 4), "unit": "credits"},
+                "time_elapsed": f"{wall:.1f}s",
                 "energy_consumption": energy_kwh,
             },
-            "schedule": schedule,
+            # ---- Schedule (wrapped to match existing solvers) ----
+            "schedule": schedule_wrapped,
             "gantt_data": _gantt_data(schedule, internal["machines"]),
+            "total_energy_kwh": energy_kwh,
+            # ---- Status / quality ----
             "solution_status": sol["status"],
             "solver_info": {
                 "solver_version": SOLVER_VERSION, "solver_family": SOLVER_FAMILY,
@@ -138,7 +151,8 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
                 "extended": extended,
             },
             "computation_metrics": {
-                "wall_time_seconds": wall, "n_variables": sol.get("n_variables"),
+                "wall_time_s": wall, "algorithm": "Pyomo_HiGHS_MIP",
+                "n_variables": sol.get("n_variables"),
                 "n_constraints": sol.get("n_constraints"),
                 "n_binaries_after_pruning": sol.get("n_binaries_after_pruning"),
                 "best_bound": sol.get("best_bound"),
@@ -160,9 +174,7 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
 
 def run(data: Dict[str, Any], solver_params: Dict[str, Any] = None, extra_arguments: Dict[str, Any] = None) -> Dict[str, Any]:
-    """QCentroid platform entry point.
-
-    Mirrors the convention used in CrlsK/classical-scheduling-solver/app.py:
+    """QCentroid platform entry point. Mirrors classical-scheduling-solver/app.py convention:
         result = qcentroid.run(dic["data"], solver_params, extra_arguments)
     """
     solver_params = solver_params or {}
@@ -225,14 +237,20 @@ def _error_result(phase, exc, started_utc, t0, dataset_sha256):
         "result": {
             "objective_value": None, "makespan_hours": None, "total_tardiness_hours": None,
             "on_time_delivery_pct": 0.0, "avg_machine_utilization_pct": 0.0, "total_changeovers": 0,
-            "benchmark": {"execution_cost": None, "time_elapsed": wall, "energy_consumption": 0.0},
-            "schedule": [], "gantt_data": [], "solution_status": "error",
+            "benchmark": {"execution_cost": {"value": 0.0, "unit": "credits"},
+                          "time_elapsed": f"{wall:.1f}s", "energy_consumption": 0.0},
+            "schedule": {"assignments": [], "gantt_data": [], "makespan": 0,
+                         "total_tardiness": 0, "total_idle_time": 0, "total_energy_kwh": 0,
+                         "total_cost": 0, "jobs_on_time": 0, "jobs_late": 0, "on_time_percentage": 0},
+            "gantt_data": [], "total_energy_kwh": 0,
+            "solution_status": "error",
             "solver_info": {
                 "solver_version": SOLVER_VERSION, "solver_family": SOLVER_FAMILY,
                 "specialist_id": SPECIALIST_ID, "specialist_source": SPECIALIST_SOURCE,
                 "error_phase": phase, "error_type": type(exc).__name__,
                 "error_message": str(exc), "traceback": traceback.format_exc(),
             },
+            "computation_metrics": {"wall_time_s": wall, "algorithm": "Pyomo_HiGHS_MIP"},
             "constraint_violations": [{"severity": "fatal", "phase": phase, "message": str(exc)}],
             "quality_metrics": {"feasible": False},
             "audit": {
