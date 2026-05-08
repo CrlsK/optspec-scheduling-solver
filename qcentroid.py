@@ -1,12 +1,13 @@
 """
-qcentroid.py - Entry point for the Dynamic Production Scheduling solver
-(MIP variant) generated via the opt-specialists pipeline.
+qcentroid.py - Round 3 entry point.
 
-Round 2: extended=False is now the default. The platform's published §3
-formulation is single-op per job; extended=True (multi-op routings,
-sequence-dependent setups) is opt-in via solver_params.extended=true.
-This keeps the time-indexed encoding small enough to solve in seconds
-on real Hisar/Jajpur datasets.
+Round 3 deltas:
+- Marco: forward `solver_params.warm_start` (list of {job_id, machine_id, start})
+  to mip_model.build_and_solve() so the MIP can resume from ALNS or any prior
+  feasible schedule. Closes the residual gap fast.
+- Priya: compute `objective_value_eur` from configurable rates so the board
+  sees rupees/EUR not opaque scalarized scores. Rates come from
+  `solver_params.business_rates` or sensible defaults.
 """
 from __future__ import annotations
 
@@ -24,20 +25,30 @@ from mip_model import build_and_solve
 from outputs import write_additional_outputs
 from additional_output_generator import generate_additional_output
 
-SOLVER_VERSION = "1.3.0-optspec-mip-base"
+SOLVER_VERSION = "1.4.0-optspec-mip-warm-eur"
 SOLVER_FAMILY = "MIP"
 SPECIALIST_ID = "MIP"
 SPECIALIST_SOURCE = "github.com/georgekorpas/opt-specialists/blob/main/03_MIP_specialist.md"
 ALGORITHM_NAME = "OptSpec_MIP_Pyomo_HiGHS"
+
+# Priya's defaults — board-friendly, calibrated to Jindal Stainless rough magnitudes.
+DEFAULT_BUSINESS_RATES = {
+    "line_rate_eur_h": 2000.0,        # opportunity cost per hour of makespan
+    "sla_penalty_eur_h": 500.0,       # SLA penalty per hour of weighted tardiness
+    "setup_cost_eur": 80.0,           # cost per changeover (cleaning + lost throughput)
+    "energy_tariff_eur_kwh": 0.12,    # weighted-average industrial tariff
+}
 
 
 def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     started_utc = datetime.now(timezone.utc).isoformat()
     t0 = time.perf_counter()
     max_exec_time_m = float(kwargs.get("max_exec_time_m", 5.0))
-    mip_gap = float(kwargs.get("mip_gap", 0.05))  # round 2: looser gap so we always return feasible
-    extended = bool(kwargs.get("extended", False))  # round 2: published §3 by default
+    mip_gap = float(kwargs.get("mip_gap", 0.05))
+    extended = bool(kwargs.get("extended", False))
     solver_name = str(kwargs.get("solver", "auto")).lower()
+    warm_start = kwargs.get("warm_start") or None
+    business_rates = {**DEFAULT_BUSINESS_RATES, **(kwargs.get("business_rates") or {})}
     raw = (input_data or {}).get("data", input_data) or {}
     payload_for_hash = json.dumps(input_data, sort_keys=True, default=str).encode("utf-8")
     dataset_sha256 = hashlib.sha256(payload_for_hash).hexdigest()
@@ -51,10 +62,10 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         return _error_result("adapter", exc, started_utc, t0, dataset_sha256)
 
     try:
-        # round 2: leave 30% of budget as buffer for output generation
         time_limit_s = max(5.0, max_exec_time_m * 60.0 * 0.7)
         sol = build_and_solve(internal, time_limit_s=time_limit_s,
-                              mip_gap=mip_gap, solver_name=solver_name, extended=extended)
+                              mip_gap=mip_gap, solver_name=solver_name,
+                              extended=extended, warm_start=warm_start)
     except Exception as exc:
         return _error_result("solver", exc, started_utc, t0, dataset_sha256)
 
@@ -73,10 +84,20 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     energy_kwh = sol.get("energy_kwh", 0.0)
     objective_value = sol["objective_value"]
 
+    # Priya: board-friendly EUR objective
+    objective_value_eur = round(
+        business_rates["line_rate_eur_h"] * makespan_hours
+        + business_rates["sla_penalty_eur_h"] * total_tardiness_hours
+        + business_rates["setup_cost_eur"] * total_changeovers
+        + business_rates["energy_tariff_eur_kwh"] * energy_kwh,
+        2,
+    )
+
     write_additional_outputs(
         additional_dir, schedule=schedule, jobs=internal["jobs"], machines=internal["machines"],
         horizon=horizon,
         kpis=dict(makespan_hours=makespan_hours, objective_value=objective_value,
+                  objective_value_eur=objective_value_eur,
                   on_time_delivery_pct=on_time_delivery_pct,
                   total_tardiness_hours=total_tardiness_hours,
                   avg_machine_utilization_pct=avg_machine_utilization_pct,
@@ -106,6 +127,7 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
     result_dict = {
         "objective_value": objective_value,
+        "objective_value_eur": objective_value_eur,  # Priya's board-friendly KPI
         "makespan_hours": makespan_hours,
         "total_tardiness_hours": total_tardiness_hours,
         "on_time_delivery_pct": on_time_delivery_pct,
@@ -128,6 +150,8 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             "modeling_library": "pyomo", "underlying_solver": sol["solver_name"],
             "mip_gap_target": mip_gap, "mip_gap_achieved": sol.get("mip_gap_achieved"),
             "extended": extended,
+            "warm_start_hits": sol.get("warm_start_hits", 0),
+            "business_rates": business_rates,
         },
         "computation_metrics": {
             "wall_time_s": wall, "algorithm": ALGORITHM_NAME,
@@ -166,8 +190,10 @@ def run(data: Dict[str, Any], solver_params: Dict[str, Any] = None,
         max_exec_time_m=float(extra_arguments.get("max_exec_time_m",
                                                   solver_params.get("max_exec_time_m", 5.0))),
         mip_gap=float(solver_params.get("mip_gap", 0.05)),
-        extended=bool(solver_params.get("extended", False)),  # round 2 default
+        extended=bool(solver_params.get("extended", False)),
         solver=str(solver_params.get("solver", "auto")).lower(),
+        warm_start=solver_params.get("warm_start") or extra_arguments.get("warm_start"),
+        business_rates=solver_params.get("business_rates"),
     )
     out = solver({"data": data}, **kwargs)
     return out["result"]
@@ -241,7 +267,8 @@ def _error_result(phase, exc, started_utc, t0, dataset_sha256):
     wall = time.perf_counter() - t0
     return {
         "result": {
-            "objective_value": None, "makespan_hours": None, "total_tardiness_hours": None,
+            "objective_value": None, "objective_value_eur": None,
+            "makespan_hours": None, "total_tardiness_hours": None,
             "on_time_delivery_pct": 0.0, "avg_machine_utilization_pct": 0.0, "total_changeovers": 0,
             "benchmark": {"execution_cost": {"value": 0.0, "unit": "credits"},
                           "time_elapsed": f"{wall:.1f}s", "energy_consumption": 0.0},
