@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.pytest_cache/
+additional_output/
+ab_test/additional_output/
+ab_test/rows.json
+ab_test/report.html
+*.egg-info/
+build/
+dist/
