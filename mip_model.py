@@ -1,24 +1,13 @@
 """
 mip_model.py — Pyomo time-indexed MIP for Dynamic Production Scheduling.
-
-Implements §3 (verbatim QCentroid formulation) and §5 (extensions for
-multi-op routings, sequence-dependent setups, time-of-use energy,
-explicit non-overlap, and frozen-prefix) from
-``01_use_case_understanding.md``.
-
-Variables
----------
-x[i, o, j, t] in {0,1}    1 if op (i, o) starts on machine j at time t
-T[i] >= 0                 tardiness of job i
-C[i] >= 0                 completion of job i
-Cmax >= 0                 makespan
-u[(i, j)] in {0,1}        job i runs on machine j (extended only)
-z[j] in Z                 changeover counter on machine j (extended only)
+Round 3: optional warm-start hook (`warm_start` arg) accepts a list of
+{job_id, op_id, machine_id, start} dicts (the ALNS schedule shape) and
+sets x[q].set_value(1) before solve, giving HiGHS a MIP start hint.
 """
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import pyomo.environ as pyo
 
@@ -29,6 +18,7 @@ def build_and_solve(
     mip_gap: float,
     solver_name: str,
     extended: bool,
+    warm_start: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     quads, q_to_p = _index_quads(internal)
     if not quads:
@@ -54,7 +44,6 @@ def build_and_solve(
         j["id"]: [(o_idx, op["id"]) for o_idx, op in enumerate(j["ops"])] for j in jobs
     }
 
-    # (1) assignment
     def _assign_rule(m, i, o):
         terms = [m.x[i, o, j, t] for (i_, o_, j, t) in m.QUADS if i_ == i and o_ == o]
         return sum(terms) == 1 if terms else pyo.Constraint.Skip
@@ -63,7 +52,6 @@ def build_and_solve(
     model.OP_PAIRS = pyo.Set(initialize=op_pairs, dimen=2)
     model.AssignOp = pyo.Constraint(model.OP_PAIRS, rule=_assign_rule)
 
-    # (4) capacity / non-overlap
     avail = {m["id"]: m["availability"] for m in machines}
     cap_pairs = [(m["id"], t) for m in machines for t in range(horizon)]
     model.CAP_PAIRS = pyo.Set(initialize=cap_pairs, dimen=2)
@@ -81,7 +69,6 @@ def build_and_solve(
 
     model.Capacity = pyo.Constraint(model.CAP_PAIRS, rule=_capacity_rule)
 
-    # (5) completion = end of last op
     def _completion_rule(m, i):
         last_op_id = job_ops[i][-1][1]
         terms = [
@@ -93,7 +80,6 @@ def build_and_solve(
 
     model.Completion = pyo.Constraint(model.JOBS, rule=_completion_rule)
 
-    # (1') multi-op precedence (extended)
     if extended:
         prec_pairs = [(j["id"], op_pair[1]) for j in jobs for op_pair in job_ops[j["id"]][1:]]
         model.PREC_PAIRS = pyo.Set(initialize=prec_pairs, dimen=2)
@@ -114,20 +100,16 @@ def build_and_solve(
 
         model.Precedence = pyo.Constraint(model.PREC_PAIRS, rule=_precedence_rule)
 
-    # (6) makespan
     model.MakespanCons = pyo.Constraint(model.JOBS, rule=lambda m, i: m.Cmax >= m.C[i])
 
-    # (7) tardiness
     due = {j["id"]: j["due_date"] for j in jobs}
     model.TardCons = pyo.Constraint(model.JOBS, rule=lambda m, i: m.T[i] >= m.C[i] - due[i])
 
-    # changeover counter z[j] (extended only)
     if extended:
         i_j_pairs = sorted({(i_, jj) for (i_, _o, jj, _t) in quads})
         model.IJ_PAIRS = pyo.Set(initialize=i_j_pairs, dimen=2)
         model.u = pyo.Var(model.IJ_PAIRS, within=pyo.Binary)
         model.z = pyo.Var(model.MACHINES, within=pyo.NonNegativeIntegers, bounds=(0, len(jobs)))
-
         quads_per_ij: Dict[Tuple[str, str], list] = {}
         for q in quads:
             i_, _o, jj, _t = q
@@ -146,7 +128,6 @@ def build_and_solve(
 
         model.Z_def = pyo.Constraint(model.MACHINES, rule=_z_rule)
 
-    # objective
     job_weight = {j["id"]: j["weight"] for j in jobs}
     energy_tou = internal.get("energy_tou") or {}
 
@@ -170,8 +151,39 @@ def build_and_solve(
         obj_terms = obj_terms + weights["delta"] * sum(model.z[jj] for jj in model.MACHINES)
     model.Obj = pyo.Objective(expr=obj_terms, sense=pyo.minimize)
 
+    # Round 3: warm-start hook -- accept ALNS or any prior schedule and seed x[q]
+    n_warm = _apply_warm_start(model, q_to_p, warm_start) if warm_start else 0
+
     chosen, results = _solve(model, solver_name, time_limit_s, mip_gap)
-    return _extract(model, internal, q_to_p, results, chosen, extended=extended)
+    out = _extract(model, internal, q_to_p, results, chosen, extended=extended)
+    out["warm_start_hits"] = n_warm
+    return out
+
+
+def _apply_warm_start(model, q_to_p, warm_start):
+    """Set x[q].value = 1 for any quad matching an ALNS-style assignment.
+
+    warm_start: list of dicts with keys job_id, op_id (optional, default 0),
+    machine_id, start (or start_time). Slot index = round(start) for hour-grid.
+    """
+    n = 0
+    for ws in warm_start or []:
+        i = ws.get("job_id")
+        o = ws.get("op_id", 0)
+        j = ws.get("machine_id")
+        t = ws.get("start", ws.get("start_time", 0))
+        try:
+            t_slot = int(round(float(t)))
+        except Exception:
+            continue
+        q = (i, o, j, t_slot)
+        if q in q_to_p:
+            try:
+                model.x[q].set_value(1)
+                n += 1
+            except Exception:
+                pass
+    return n
 
 
 def _index_quads(internal):
