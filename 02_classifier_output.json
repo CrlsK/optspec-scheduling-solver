@@ -1,0 +1,27 @@
+{
+  "_comment": "Output of 00_classifier.md applied to the QCentroid use case 743 (Dynamic Production Scheduling with Quantum-Inspired Metaheuristics) using the published formulation in §3 of 01_use_case_understanding.md as the LaTeX input. Classifier rules followed: Step 1 (no MOO/DP/SP/RO/CP-dominant); Step 2 algebraic table -> mixed vars + linear obj + linear cons -> MIP; Step 3 tie-breaker 'Linear model with indicator / Big-M / logical constraints -> MIP' applies because machine-availability gating (a_{jt}=0 -> x_{ijt}=0) is a logical / indicator constraint.",
+  "specialist_id": "MIP",
+  "confidence": "high",
+  "extracted_features": {
+    "variable_types": "mixed",
+    "n_variables_estimate": "symbolic",
+    "objective_form": "linear",
+    "constraint_forms": ["linear", "logical"],
+    "convexity": "convex-relaxation",
+    "uncertainty": "none",
+    "time_structure": "dynamic",
+    "n_objectives": 1
+  },
+  "justification": "The published formulation uses binary time-indexed assignment variables x_{ijt} (mixed, with continuous C_i), a linear weighted-sum objective in C_max + sum w_i T_i + sum c_{ij} x_{ijt}, and linear constraints (assignment <= 1, capacity <= 1, release-time, machine-availability via x_{ijt}=0 when a_{jt}=0). No quadratic terms appear in either the objective or the constraints. Per Step 2 of the classifier (mixed vars + linear obj + linear cons -> MIP) and per Step 3's explicit tie-breaker for indicator-style constraints, the route is MIP.",
+  "alternatives_considered": [
+    {"specialist_id": "CP", "reason_rejected": "Step 1.5 of the classifier ('heavy combinatorial scheduling structure -> CP') is plausible because production scheduling is a classic CP target with NoOverlap/Cumulative interval variables. However, the formulation as written by the platform is purely algebraic with binary x_{ijt} variables and linear capacity / availability inequalities - there are no global-constraint primitives (AllDifferent, NoOverlap, Cumulative) in the formulation. The classifier must route on the formulation as presented, not on a reformulation. Recommend running CP-SAT as a complementary alternative."},
+    {"specialist_id": "MOO", "reason_rejected": "Three KPIs (makespan, tardiness, cost) are scalarized into one objective with user-supplied weights alpha, beta, gamma. Per Step 1.1, MOO applies only when no a-priori scalarization is given."},
+    {"specialist_id": "DP", "reason_rejected": "The word 'dynamic' in the use case title refers to rolling-horizon re-planning, not to a Bellman state-transition / optimal-control formulation. Per Step 1.2, DP requires explicit state, action, transition, reward."},
+    {"specialist_id": "SP", "reason_rejected": "No explicit probability distributions or scenario sets are declared. Per Step 1.3, SP requires modeled stochastic recourse."}
+  ],
+  "warnings": [
+    "Gap analysis: published formulation is missing (a) multi-operation routings, (b) sequence-dependent setups, (c) explicit non-preemption encoding, (d) time-of-use energy tariff, (e) frozen-prefix semantics, (f) labor/materials variables. The MIP solver in this repo implements §3 verbatim AND closes gaps (a)-(e) via the §5 extensions controlled by the `extended=True` flag.",
+    "Scalability: time-indexed encoding has |J|*|M|*|T| binaries. For 50x20x480 = 480k binaries, open-source HiGHS will time out. CP-SAT with interval variables typically dominates here.",
+    "QCentroid output schema requires top-level numeric KPIs makespan_hours, objective_value, on_time_delivery_pct, total_tardiness_hours, avg_machine_utilization_pct, total_changeovers - all present in the new solver's result dict."
+  ]
+}
