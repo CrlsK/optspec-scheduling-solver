@@ -2,15 +2,11 @@
 qcentroid.py - Entry point for the Dynamic Production Scheduling solver
 (MIP variant) generated via the opt-specialists pipeline.
 
-Pipeline source: opt-specialists / 00_classifier.md -> 03_MIP_specialist.md
-QCentroid use case 743: Dynamic Production Scheduling with Quantum-Inspired Metaheuristics
-
-Output schema is aligned with the two existing solvers
-(jindalstainless-classical-scheduling-alns-cpu and
-jindalstainless-quantum-scheduling-qubo-sqa-cpu) so the platform's benchmark
-charts compare all three uniformly. additional_output_generator.py is
-identical (in behavior) to the one used by classical/quantum solvers, so
-the same 12 visualization files appear for each solver in the file viewer.
+Round 2: extended=False is now the default. The platform's published §3
+formulation is single-op per job; extended=True (multi-op routings,
+sequence-dependent setups) is opt-in via solver_params.extended=true.
+This keeps the time-indexed encoding small enough to solve in seconds
+on real Hisar/Jajpur datasets.
 """
 from __future__ import annotations
 
@@ -28,7 +24,7 @@ from mip_model import build_and_solve
 from outputs import write_additional_outputs
 from additional_output_generator import generate_additional_output
 
-SOLVER_VERSION = "1.2.0-optspec-mip-aog"
+SOLVER_VERSION = "1.3.0-optspec-mip-base"
 SOLVER_FAMILY = "MIP"
 SPECIALIST_ID = "MIP"
 SPECIALIST_SOURCE = "github.com/georgekorpas/opt-specialists/blob/main/03_MIP_specialist.md"
@@ -38,9 +34,9 @@ ALGORITHM_NAME = "OptSpec_MIP_Pyomo_HiGHS"
 def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     started_utc = datetime.now(timezone.utc).isoformat()
     t0 = time.perf_counter()
-    max_exec_time_m = float(kwargs.get("max_exec_time_m", 10.0))
-    mip_gap = float(kwargs.get("mip_gap", 0.01))
-    extended = bool(kwargs.get("extended", True))
+    max_exec_time_m = float(kwargs.get("max_exec_time_m", 5.0))
+    mip_gap = float(kwargs.get("mip_gap", 0.05))  # round 2: looser gap so we always return feasible
+    extended = bool(kwargs.get("extended", False))  # round 2: published §3 by default
     solver_name = str(kwargs.get("solver", "auto")).lower()
     raw = (input_data or {}).get("data", input_data) or {}
     payload_for_hash = json.dumps(input_data, sort_keys=True, default=str).encode("utf-8")
@@ -55,8 +51,9 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         return _error_result("adapter", exc, started_utc, t0, dataset_sha256)
 
     try:
-        sol = build_and_solve(internal,
-                              time_limit_s=max(5.0, max_exec_time_m * 60.0 - 5.0),
+        # round 2: leave 30% of budget as buffer for output generation
+        time_limit_s = max(5.0, max_exec_time_m * 60.0 * 0.7)
+        sol = build_and_solve(internal, time_limit_s=time_limit_s,
                               mip_gap=mip_gap, solver_name=solver_name, extended=extended)
     except Exception as exc:
         return _error_result("solver", exc, started_utc, t0, dataset_sha256)
@@ -108,26 +105,22 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     }
 
     result_dict = {
-        # Top-level KPIs (drive QCentroid benchmark charts; aligned)
         "objective_value": objective_value,
         "makespan_hours": makespan_hours,
         "total_tardiness_hours": total_tardiness_hours,
         "on_time_delivery_pct": on_time_delivery_pct,
         "avg_machine_utilization_pct": avg_machine_utilization_pct,
         "total_changeovers": total_changeovers,
-        # benchmark sub-dict (shape matches existing solvers)
         "benchmark": {
             "execution_cost": {"value": round(wall * 0.5, 4), "unit": "credits"},
             "time_elapsed": f"{wall:.1f}s",
             "energy_consumption": energy_kwh,
         },
-        # Schedule wrapped + per-machine + per-job (drives the rich additional_output reports)
         "schedule": schedule_wrapped,
         "gantt_data": _gantt_data(schedule, internal["machines"]),
         "total_energy_kwh": energy_kwh,
         "machine_utilization": machine_util,
         "job_metrics": job_metrics,
-        # Status / quality
         "solution_status": sol["status"],
         "solver_info": {
             "solver_version": SOLVER_VERSION, "solver_family": SOLVER_FAMILY,
@@ -156,11 +149,10 @@ def solver(input_data: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         },
     }
 
-    # Write the rich additional_output/ files (the same 12 the other 2 solvers write)
     try:
         generate_additional_output(raw, result_dict, algorithm_name=ALGORITHM_NAME)
     except Exception:
-        pass  # non-fatal; basic gantt.html etc. were already written by write_additional_outputs
+        pass
 
     return {"result": result_dict}
 
@@ -172,16 +164,15 @@ def run(data: Dict[str, Any], solver_params: Dict[str, Any] = None,
     extra_arguments = extra_arguments or {}
     kwargs = dict(
         max_exec_time_m=float(extra_arguments.get("max_exec_time_m",
-                                                  solver_params.get("max_exec_time_m", 10.0))),
-        mip_gap=float(solver_params.get("mip_gap", 0.01)),
-        extended=bool(solver_params.get("extended", True)),
+                                                  solver_params.get("max_exec_time_m", 5.0))),
+        mip_gap=float(solver_params.get("mip_gap", 0.05)),
+        extended=bool(solver_params.get("extended", False)),  # round 2 default
         solver=str(solver_params.get("solver", "auto")).lower(),
     )
     out = solver({"data": data}, **kwargs)
     return out["result"]
 
 
-# ----- helpers -----
 def _on_time_pct(schedule, jobs):
     if not jobs:
         return 100.0
@@ -195,7 +186,6 @@ def _on_time_pct(schedule, jobs):
 
 
 def _per_machine_utilization(schedule, machines, horizon):
-    """Return {machine_id: {utilization_percentage, total_processing_hours, idle_time_hours, num_jobs}}."""
     out = {}
     for m in machines:
         mid = m["id"]
@@ -211,7 +201,6 @@ def _per_machine_utilization(schedule, machines, horizon):
 
 
 def _per_job_metrics(schedule, jobs):
-    """Return {job_id: {completion_time, due_date, tardiness, on_time}}."""
     by_job = {}
     for s in schedule:
         by_job.setdefault(s["job_id"], 0)
@@ -221,22 +210,9 @@ def _per_job_metrics(schedule, jobs):
         completion = by_job.get(j["id"], 0)
         due = j.get("due_date", 0)
         tardiness = max(0, completion - due)
-        out[j["id"]] = {
-            "completion_time": completion,
-            "due_date": due,
-            "tardiness": tardiness,
-            "on_time": tardiness == 0,
-        }
+        out[j["id"]] = {"completion_time": completion, "due_date": due,
+                        "tardiness": tardiness, "on_time": tardiness == 0}
     return out
-
-
-def _utilization_pct(schedule, machines, horizon):
-    if not machines or horizon <= 0:
-        return 0.0
-    busy = {m["id"]: 0 for m in machines}
-    for s in schedule:
-        busy[s["machine_id"]] = busy.get(s["machine_id"], 0) + (s["end"] - s["start"])
-    return round(100.0 * sum(busy.values()) / (len(machines) * horizon), 2)
 
 
 def _count_changeovers(schedule):
@@ -255,9 +231,8 @@ def _count_changeovers(schedule):
 def _gantt_data(schedule, machines):
     return [
         {"task_id": f'{s["job_id"]}.{s.get("op_id", 0)}',
-         "resource_id": s["machine_id"],
-         "start_hour": s["start"], "end_hour": s["end"],
-         "label": f'job {s["job_id"]}'}
+         "resource_id": s["machine_id"], "start_hour": s["start"],
+         "end_hour": s["end"], "label": f'job {s["job_id"]}'}
         for s in schedule
     ]
 
@@ -267,8 +242,7 @@ def _error_result(phase, exc, started_utc, t0, dataset_sha256):
     return {
         "result": {
             "objective_value": None, "makespan_hours": None, "total_tardiness_hours": None,
-            "on_time_delivery_pct": 0.0, "avg_machine_utilization_pct": 0.0,
-            "total_changeovers": 0,
+            "on_time_delivery_pct": 0.0, "avg_machine_utilization_pct": 0.0, "total_changeovers": 0,
             "benchmark": {"execution_cost": {"value": 0.0, "unit": "credits"},
                           "time_elapsed": f"{wall:.1f}s", "energy_consumption": 0.0},
             "schedule": {"assignments": [], "gantt_data": [], "makespan": 0,
